@@ -26,13 +26,7 @@ brubeck_internal__sample(struct brubeck_metric *metric, brubeck_sample_cb sample
 	WITH_SUFFIX(".unique_keys") {
 		value = brubeck_atomic_fetch(&stats->live.unique_keys);
 		stats->sample.unique_keys = value;
-		sample(key, (value_t)value, opaque);
-		sample(metric, key, value, opaque);
-	}
-
-	WITH_SUFFIX(".memory") {
-		value = brubeck_atomic_fetch(&stats->memory);
-		sample(metric, key, value, opaque);
+		sample(metric, key, (value_t)value, opaque);
 	}
 
 	/* Secure statsd endpoint */
@@ -49,12 +43,12 @@ brubeck_internal__sample(struct brubeck_metric *metric, brubeck_sample_cb sample
 	}
 
 	WITH_SUFFIX(".secure.delayed") {
-		value = brubeck_atomic_swap(&stats->secure.delayed, 0);
+		value = brubeck_atomic_swap(&stats->live.secure.delayed, 0);
 		sample(metric, key, (value_t)value, opaque);
 	}
 
 	WITH_SUFFIX(".secure.replayed") {
-		value = brubeck_atomic_swap(&stats->secure.replayed, 0);
+		value = brubeck_atomic_swap(&stats->live.secure.replayed, 0);
 		sample(metric, key, (value_t)value, opaque);
 	}
 
