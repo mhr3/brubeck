@@ -12,6 +12,7 @@ struct brubeck_backend {
 	int shard_n;
 
 	int (*connect)(void *);
+	bool (*is_connected)(void *);
 	void (*sample)(const struct brubeck_metric*, const char *, value_t, void *);
 	void (*flush)(void *);
 

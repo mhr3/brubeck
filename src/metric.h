@@ -10,6 +10,10 @@ enum brubeck_metric_t {
 	BRUBECK_MT_INTERNAL_STATS
 };
 
+enum brubeck_metric_mod_t {
+	BRUBECK_MOD_RELATIVE_VALUE = 1
+};
+
 enum brubeck_aggregate_t {
 	BRUBECK_AG_LAST,
 	BRUBECK_AG_SUM,
@@ -26,6 +30,10 @@ enum {
 
 struct brubeck_metric {
 	struct brubeck_metric *next;
+
+#ifdef BRUBECK_METRICS_FLOW
+	uint64_t flow;
+#endif
 
 	pthread_spinlock_t lock;
 	uint16_t key_len;
@@ -53,10 +61,11 @@ typedef void (*brubeck_sample_cb)(
 	void *backend);
 
 void brubeck_metric_sample(struct brubeck_metric *metric, brubeck_sample_cb cb, void *backend);
-void brubeck_metric_record(struct brubeck_metric *metric, value_t value);
+void brubeck_metric_record(struct brubeck_metric *metric, value_t value, value_t sample_rate, uint8_t modifiers);
 
 struct brubeck_metric *brubeck_metric_new(struct brubeck_server *server, const char *, size_t, uint8_t);
 struct brubeck_metric *brubeck_metric_find(struct brubeck_server *server, const char *, size_t, uint8_t);
+struct brubeck_backend *brubeck_metric_shard(struct brubeck_server *server, struct brubeck_metric *);
 
 #define WITH_SUFFIX(suffix) memcpy(key + metric->key_len, suffix, strlen(suffix) + 1);
 

@@ -19,10 +19,18 @@ new_metric(struct brubeck_server *server, const char *key, size_t key_len, uint8
 	metric->type = type;
 	pthread_spin_init(&metric->lock, PTHREAD_PROCESS_PRIVATE);
 
+#ifdef BRUBECK_METRICS_FLOW
+	metric->flow = 0;
+#else
+	/* Compile time assert: ensure that the metric struct can be packed
+	 * in a single slab */
+	ct_assert(sizeof(struct brubeck_metric) <= (SLAB_SIZE));
+#endif
+
 	return metric;
 }
 
-typedef void (*mt_prototype_record)(struct brubeck_metric *, value_t);
+typedef void (*mt_prototype_record)(struct brubeck_metric *, value_t, value_t, uint8_t);
 typedef void (*mt_prototype_sample)(struct brubeck_metric *, brubeck_sample_cb, void *);
 
 
@@ -32,11 +40,15 @@ typedef void (*mt_prototype_sample)(struct brubeck_metric *, brubeck_sample_cb, 
  * ALLOC: mt + 4 bytes
  *********************************************/
 static void
-gauge__record(struct brubeck_metric *metric, value_t value)
+gauge__record(struct brubeck_metric *metric, value_t value, value_t sample_freq, uint8_t modifiers)
 {
 	pthread_spin_lock(&metric->lock);
 	{
-		metric->as.gauge.value = value;
+		if (modifiers & BRUBECK_MOD_RELATIVE_VALUE) {
+			metric->as.gauge.value += value;
+		} else {
+			metric->as.gauge.value = value;
+		}
 	}
 	pthread_spin_unlock(&metric->lock);
 }
@@ -62,8 +74,11 @@ gauge__sample(struct brubeck_metric *metric, brubeck_sample_cb sample, void *opa
  * ALLOC: mt + 4
  *********************************************/
 static void
-meter__record(struct brubeck_metric *metric, value_t value)
+meter__record(struct brubeck_metric *metric, value_t value, value_t sample_freq, uint8_t modifiers)
 {
+	/* upsample */
+	value *= sample_freq;
+
 	pthread_spin_lock(&metric->lock);
 	{
 		metric->as.meter.value += value;
@@ -93,8 +108,11 @@ meter__sample(struct brubeck_metric *metric, brubeck_sample_cb sample, void *opa
  * ALLOC: mt + 4 + 4 + 4
  *********************************************/
 static void
-counter__record(struct brubeck_metric *metric, value_t value)
+counter__record(struct brubeck_metric *metric, value_t value, value_t sample_freq, uint8_t modifiers)
 {
+	/* upsample */
+	value *= sample_freq;
+
 	pthread_spin_lock(&metric->lock);
 	{
 		if (metric->as.counter.previous > 0.0) {
@@ -132,11 +150,11 @@ counter__sample(struct brubeck_metric *metric, brubeck_sample_cb sample, void *o
  * ALLOC: mt + 16 + 4
  *********************************************/
 static void
-histogram__record(struct brubeck_metric *metric, value_t value)
+histogram__record(struct brubeck_metric *metric, value_t value, value_t sample_freq, uint8_t modifiers)
 {
 	pthread_spin_lock(&metric->lock);
 	{
-		brubeck_histo_push(&metric->as.histogram, value);
+		brubeck_histo_push(&metric->as.histogram, value, sample_freq);
 	}
 	pthread_spin_unlock(&metric->lock);
 }
@@ -159,6 +177,16 @@ histogram__sample(struct brubeck_metric *metric, brubeck_sample_cb sample, void 
 	key = alloca(metric->key_len + strlen(".percentile.999") + 1);
 	memcpy(key, metric->key, metric->key_len);
 
+
+	WITH_SUFFIX(".count") {
+		sample(metric, key, hsample.count, opaque);
+	}
+
+	/* if there have been no metrics during this sampling period,
+	 * we don't need to report any of the histogram samples */
+	if (hsample.count == 0.0)
+		return;
+
 	WITH_SUFFIX(".min") {
 		sample(metric, key, hsample.min, opaque);
 	}
@@ -173,10 +201,6 @@ histogram__sample(struct brubeck_metric *metric, brubeck_sample_cb sample, void 
 
 	WITH_SUFFIX(".mean") {
 		sample(metric, key, hsample.mean, opaque);
-	}
-
-	WITH_SUFFIX(".count") {
-		sample(metric, key, hsample.count, opaque);
 	}
 
 	WITH_SUFFIX(".median") {
@@ -252,20 +276,24 @@ void brubeck_metric_sample(struct brubeck_metric *metric, brubeck_sample_cb cb, 
 	_prototypes[metric->type].sample(metric, cb, backend);
 }
 
-void brubeck_metric_record(struct brubeck_metric *metric, value_t value)
+void brubeck_metric_record(struct brubeck_metric *metric, value_t value, value_t sample_freq, uint8_t modifiers)
 {
-	_prototypes[metric->type].record(metric, value);
+	_prototypes[metric->type].record(metric, value, sample_freq, modifiers);
+}
+
+struct brubeck_backend *
+brubeck_metric_shard(struct brubeck_server *server, struct brubeck_metric *metric)
+{
+	int shard = 0;
+	if (server->active_backends > 1)
+		shard = CityHash32(metric->key, metric->key_len) % server->active_backends;
+	return server->backends[shard];
 }
 
 struct brubeck_metric *
 brubeck_metric_new(struct brubeck_server *server, const char *key, size_t key_len, uint8_t type)
 {
 	struct brubeck_metric *metric;
-	int shard = 0;
-
-	/* Compile time assert: ensure that the metric struct can be packed
-	 * in a single slab */
-	ct_assert(sizeof(struct brubeck_metric) <= (SLAB_SIZE));
 
 	metric = new_metric(server, key, key_len, type);
 	if (!metric)
@@ -274,13 +302,10 @@ brubeck_metric_new(struct brubeck_server *server, const char *key, size_t key_le
 	if (!brubeck_hashtable_insert(server->metrics, metric->key, metric->key_len, metric))
 		return brubeck_hashtable_find(server->metrics, key, key_len);
 
-	if (server->active_backends > 1)
-		shard = CityHash32(key, key_len) % server->active_backends;
-
-	brubeck_backend_register_metric(server->backends[shard], metric);
+	brubeck_backend_register_metric(brubeck_metric_shard(server, metric), metric);
 
 	/* Record internal stats */
-	brubeck_atomic_inc(&server->stats.unique_keys);
+	brubeck_stats_inc(server, unique_keys);
 	return metric;
 }
 
@@ -298,6 +323,10 @@ brubeck_metric_find(struct brubeck_server *server, const char *key, size_t key_l
 
 		return brubeck_metric_new(server, key, key_len, type);
 	}
+
+#ifdef BRUBECK_METRICS_FLOW
+	brubeck_atomic_inc(&metric->flow);
+#endif
 
 	metric->expire = BRUBECK_EXPIRE_ACTIVE;
 	return metric;

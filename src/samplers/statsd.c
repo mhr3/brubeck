@@ -10,18 +10,20 @@
 #	endif
 #endif
 
-#define MAX_PACKET_SIZE 512
+#define MAX_PACKET_SIZE 8192
 
 #ifdef HAVE_RECVMMSG
+
+#ifndef MSG_WAITFORONE
+#	define MSG_WAITFORONE 0x0
+#endif
+
 static void statsd_run_recvmmsg(struct brubeck_statsd *statsd, int sock)
 {
 	const unsigned int SIM_PACKETS = statsd->mmsg_count;
 	struct brubeck_server *server = statsd->sampler.server;
 
-	struct brubeck_statsd_msg msg;
-	struct brubeck_metric *metric;
 	unsigned int i;
-
 	struct iovec iovecs[SIM_PACKETS];
 	struct mmsghdr msgs[SIM_PACKETS];
 
@@ -29,7 +31,7 @@ static void statsd_run_recvmmsg(struct brubeck_statsd *statsd, int sock)
 
 	for (i = 0; i < SIM_PACKETS; ++i) {
 		iovecs[i].iov_base = xmalloc(MAX_PACKET_SIZE);
-		iovecs[i].iov_len = MAX_PACKET_SIZE;
+		iovecs[i].iov_len = MAX_PACKET_SIZE - 1;
 		msgs[i].msg_hdr.msg_iov = &iovecs[i];
 		msgs[i].msg_hdr.msg_iovlen = 1;
 	}
@@ -37,38 +39,24 @@ static void statsd_run_recvmmsg(struct brubeck_statsd *statsd, int sock)
 	log_splunk("sampler=statsd event=worker_online syscall=recvmmsg socket=%d", sock);
 
 	for (;;) {
-		int res = recvmmsg(sock, msgs, SIM_PACKETS, 0, NULL);
+		int res = recvmmsg(sock, msgs, SIM_PACKETS, MSG_WAITFORONE, NULL);
 
 		if (res < 0) {
 			if (errno == EAGAIN || errno == EINTR)
 				continue;
 
 			log_splunk_errno("sampler=statsd event=failed_read");
-			brubeck_server_mark_dropped(server);
+			brubeck_stats_inc(server, errors);
 			continue;
 		}
 
 		/* store stats */
-		brubeck_atomic_add(&server->stats.metrics, SIM_PACKETS);
 		brubeck_atomic_add(&statsd->sampler.inflow, SIM_PACKETS);
 
 		for (i = 0; i < SIM_PACKETS; ++i) {
 			char *buf = msgs[i].msg_hdr.msg_iov->iov_base;
-			int len = msgs[i].msg_len;
-
-			if (brubeck_statsd_msg_parse(&msg, buf, len) < 0) {
-				if (msg.key_len > 0)
-					buf[msg.key_len] = ':';
-
-				log_splunk("sampler=statsd event=bad_key key='%.*s'", len, buf);
-
-				brubeck_server_mark_dropped(server);
-				continue;
-			}
-
-			metric = brubeck_metric_find(server, msg.key, msg.key_len, msg.type);
-			if (metric != NULL)
-				brubeck_metric_record(metric, msg.value);
+			char *end = buf + msgs[i].msg_len;
+			brubeck_statsd_packet_parse(server, buf, end);
 		}
 	}
 }
@@ -78,11 +66,7 @@ static void statsd_run_recvmsg(struct brubeck_statsd *statsd, int sock)
 {
 	struct brubeck_server *server = statsd->sampler.server;
 
-	struct brubeck_statsd_msg msg;
-	struct brubeck_metric *metric;
-
-	char buffer[MAX_PACKET_SIZE];
-
+	char *buffer = xmalloc(MAX_PACKET_SIZE);
 	struct sockaddr_in reporter;
 	socklen_t reporter_len = sizeof(reporter);
 	memset(&reporter, 0, reporter_len);
@@ -90,8 +74,7 @@ static void statsd_run_recvmsg(struct brubeck_statsd *statsd, int sock)
 	log_splunk("sampler=statsd event=worker_online syscall=recvmsg socket=%d", sock);
 
 	for (;;) {
-		int res = recvfrom(sock, buffer,
-			sizeof(buffer) - 1, 0,
+		int res = recvfrom(sock, buffer, MAX_PACKET_SIZE - 1, 0,
 			(struct sockaddr *)&reporter, &reporter_len);
 
 		if (res < 0) {
@@ -100,36 +83,62 @@ static void statsd_run_recvmsg(struct brubeck_statsd *statsd, int sock)
 
 			log_splunk_errno("sampler=statsd event=failed_read from=%s",
 				inet_ntoa(reporter.sin_addr));
-			brubeck_server_mark_dropped(server);
+			brubeck_stats_inc(server, errors);
 			continue;
 		}
 
-		/* store stats */
-		brubeck_atomic_inc(&server->stats.metrics);
 		brubeck_atomic_inc(&statsd->sampler.inflow);
-
-		if (brubeck_statsd_msg_parse(&msg, buffer, (size_t)res) < 0) {
-			if (msg.key_len > 0)
-				buffer[msg.key_len] = ':';
-
-			log_splunk("sampler=statsd event=bad_key key='%.*s' from=%s",
-				res, buffer, inet_ntoa(reporter.sin_addr));
-
-			brubeck_server_mark_dropped(server);
-			continue;
-		}
-
-		metric = brubeck_metric_find(server, msg.key, msg.key_len, msg.type);
-		if (metric != NULL) {
-			brubeck_metric_record(metric, msg.value);
-		}
+		brubeck_statsd_packet_parse(server, buffer, buffer + res);
 	}
-
 }
 
-int brubeck_statsd_msg_parse(struct brubeck_statsd_msg *msg, char *buffer, size_t length)
+static inline char *
+parse_float(char *buffer, value_t *result, uint8_t *mods)
 {
-	char *end = buffer + length;
+	int negative = 0;
+	char *start = buffer;
+	value_t value = 0.0;
+
+	if (*buffer == '-') {
+		++buffer;
+		negative = 1;
+		*mods |= BRUBECK_MOD_RELATIVE_VALUE;
+	} else if (*buffer == '+') {
+		++buffer;
+		*mods |= BRUBECK_MOD_RELATIVE_VALUE;
+	}
+
+	while (*buffer >= '0' && *buffer <= '9') {
+		value = (value * 10.0) + (*buffer - '0');
+		++buffer;
+	}
+
+	if (*buffer == '.') {
+		double f = 0.0;
+		int n = 0;
+		++buffer;
+
+		while (*buffer >= '0' && *buffer <= '9') {
+			f = (f * 10.0) + (*buffer - '0');
+			buffer++;
+			n++;
+		}
+
+		value += f / pow(10.0, n);
+	}
+
+	if (negative)
+		value = -value;
+
+	if (unlikely(*buffer == 'e' || *buffer == 'E'))
+		value = strtod(start, &buffer);
+
+	*result = value;
+	return buffer;
+}
+
+int brubeck_statsd_msg_parse(struct brubeck_statsd_msg *msg, char *buffer, char *end)
+{
 	*end = '\0';
 
 	/**
@@ -166,40 +175,8 @@ int brubeck_statsd_msg_parse(struct brubeck_statsd_msg *msg, char *buffer, size_
 	 *             ^^^
 	 */
 	{
-		int negative = 0;
-		char *start = buffer;
-
-		msg->value = 0.0;
-
-		if (*buffer == '-') {
-			++buffer;
-			negative = 1;
-		}
-
-		while (*buffer >= '0' && *buffer <= '9') {
-			msg->value = (msg->value * 10.0) + (*buffer - '0');
-			++buffer;
-		}
-
-		if (*buffer == '.') {
-			double f = 0.0, n = 0.0;
-			++buffer;
-
-			while (*buffer >= '0' && *buffer <= '9') {
-				f = (f * 10.0) + (*buffer - '0');
-				++buffer;
-				n += 1.0;
-			}
-
-			msg->value += f / pow(10.0, n);
-		}
-
-		if (negative)
-			msg->value = -msg->value;
-
-		if (unlikely(*buffer == 'e')) {
-			msg->value = strtod(start, &buffer);
-		}
+		msg->modifiers = 0;
+		buffer = parse_float(buffer, &msg->value, &msg->modifiers);
 
 		if (*buffer != '|')
 			return -1;
@@ -230,30 +207,61 @@ int brubeck_statsd_msg_parse(struct brubeck_statsd_msg *msg, char *buffer, size_
 			default:
 					  return -1;
 		}
+
+		buffer++;
 	}
 
 	/**
-	 * Trailing bytes: data appended at the end of the message.
-	 * This is stored verbatim and will be parsed when processing
-	 * the specific message type. This is optional.
+	 * Sample rate: parse the sample rate trailer if it exists.
+	 * It must be a floating point number between 0.0 and 1.0
 	 *
 	 *      gorets:1|c|@0.1
 	 *                 ^^^^----
 	 */
 	{
-		buffer++;
+		if (buffer[0] == '|' && buffer[1] == '@') {
+			double sample_rate;
+			uint8_t dummy;
 
-		if (buffer[0] == '\0' || (buffer[0] == '\n' && buffer[1] == '\0')) {
-			msg->trail = NULL;
-			return 0;
+			buffer = parse_float(buffer + 2, &sample_rate, &dummy);
+			if (sample_rate <= 0.0 || sample_rate > 1.0)
+				return -1;
+
+			msg->sample_freq = (1.0 / sample_rate);
+		} else {
+			msg->sample_freq = 1.0;
 		}
+
+
+		if (buffer[0] == '\0' || (buffer[0] == '\n' && buffer[1] == '\0'))
+			return 0;
 			
-		if (*buffer == '@' || *buffer == '|') {
-			msg->trail = buffer;
-			return 0;
+		return -1;
+	}
+}
+
+void brubeck_statsd_packet_parse(struct brubeck_server *server, char *buffer, char *end)
+{
+	struct brubeck_statsd_msg msg;
+	struct brubeck_metric *metric;
+
+	while (buffer < end) {
+		char *stat_end = memchr(buffer, '\n', end - buffer);
+		if (!stat_end)
+			stat_end = end;
+
+		if (brubeck_statsd_msg_parse(&msg, buffer, stat_end) < 0) {
+			brubeck_stats_inc(server, errors);
+			log_splunk("sampler=statsd event=packet_drop");
+		} else {
+			brubeck_stats_inc(server, metrics);
+			metric = brubeck_metric_find(server, msg.key, msg.key_len, msg.type);
+			if (metric != NULL)
+				brubeck_metric_record(metric, msg.value, msg.sample_freq, msg.modifiers);
 		}
 
-		return -1;
+		/* move buf past this stat */
+		buffer = stat_end + 1;
 	}
 }
 

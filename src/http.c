@@ -4,6 +4,53 @@
 #include "microhttpd.h"
 #include "jansson.h"
 
+#ifdef BRUBECK_METRICS_FLOW
+
+static int flow_cmp(const void *a, const void *b)
+{
+	const struct brubeck_metric *ma = *(const struct brubeck_metric **)a;
+	const struct brubeck_metric *mb = *(const struct brubeck_metric **)b;
+	if (ma->flow < mb->flow) return 1;
+	if (ma->flow > mb->flow) return -1;
+	return 0;
+}
+
+static struct MHD_Response *
+flow_stats(struct brubeck_server *server)
+{
+	size_t metric_count, i, topn;
+	struct brubeck_metric **metrics;
+	json_t *top_metrics_j;
+	char *jsonr;
+
+	metrics = brubeck_hashtable_to_a(server->metrics, &metric_count);
+	qsort(metrics, metric_count, sizeof(struct brubeck_metric *), &flow_cmp);
+
+	topn = (metric_count < 32) ? metric_count : 32;
+	top_metrics_j = json_object();
+
+	for (i = 0; i < topn; ++i) {
+		struct brubeck_metric *m = metrics[i];
+		json_object_set_new(top_metrics_j, m->key, json_integer(m->flow));
+	}
+
+	free(metrics);
+	jsonr = json_dumps(top_metrics_j, JSON_INDENT(4) | JSON_PRESERVE_ORDER);
+	json_decref(top_metrics_j);
+
+	return MHD_create_response_from_data(strlen(jsonr), jsonr, 1, 0);
+}
+
+#else
+
+static struct MHD_Response *
+flow_stats(struct brubeck_server *server)
+{
+	return NULL;
+}
+
+#endif
+
 static struct brubeck_metric *safe_lookup_metric(struct brubeck_server *server, const char *key)
 {
 	return brubeck_hashtable_find(server->metrics, key, (uint16_t)strlen(key));
@@ -110,21 +157,53 @@ send_stats(struct brubeck_server *brubeck)
 	}
 
 	secure = json_pack("{s:i, s:i, s:i, s:i}",
-		"failed", brubeck->stats.secure.failed,
-		"from_future", brubeck->stats.secure.from_future,
-		"delayed", brubeck->stats.secure.delayed,
-		"replayed", brubeck->stats.secure.replayed
+		"failed", brubeck_stats_sample(brubeck, secure.failed),
+		"from_future", brubeck_stats_sample(brubeck, secure.from_future),
+		"delayed", brubeck_stats_sample(brubeck, secure.delayed),
+		"replayed", brubeck_stats_sample(brubeck, secure.replayed)
 	);
 
-	stats = json_pack("{s:s, s:i, s:i, s:i, s:i, s:o, s:o, s:o}",
+	stats = json_pack("{s:s, s:i, s:i, s:i, s:o, s:o, s:o}",
 		"version", "brubeck " GIT_SHA,
-		"metrics", brubeck->stats.metrics,
-		"errors", brubeck->stats.errors,
-		"unique_keys", brubeck->stats.unique_keys,
-		"memory", brubeck->stats.memory,
+		"metrics", brubeck_stats_sample(brubeck, metrics),
+		"errors", brubeck_stats_sample(brubeck, errors),
+		"unique_keys", brubeck_stats_sample(brubeck, unique_keys),
 		"secure", secure,
 		"backends", backends,
 		"samplers", samplers);
+
+	jsonr = json_dumps(stats, JSON_INDENT(4) | JSON_PRESERVE_ORDER);
+	json_decref(stats);
+	return MHD_create_response_from_data(
+		strlen(jsonr), jsonr, 1, 0);
+}
+
+static struct MHD_Response *
+send_ping(struct brubeck_server *brubeck)
+{
+	const value_t frequency = (double)brubeck->internal_stats.sample_freq;
+	const char *status = "OK";
+
+	char *jsonr;
+	json_t *stats;
+	int i;
+
+	for (i = 0; i < brubeck->active_backends; ++i) {
+		struct brubeck_backend *backend = brubeck->backends[i];
+		if (!backend->is_connected(backend)) {
+			status = "ERROR (backend disconnected)";
+			break;
+		}
+	}
+
+	stats = json_pack("{s:s, s:i, s:s, s:f, s:f, s:i}",
+		"version", "brubeck " GIT_SHA,
+		"pid", (int)getpid(),
+		"status", status,
+		"metrics_per_second", (value_t)brubeck_stats_sample(brubeck, metrics) / frequency,
+		"errors_per_second", (value_t)brubeck_stats_sample(brubeck, errors) / frequency,
+		"unique_keys", brubeck_stats_sample(brubeck, unique_keys)
+	);
 
 	jsonr = json_dumps(stats, JSON_INDENT(4) | JSON_PRESERVE_ORDER);
 	json_decref(stats);
@@ -143,20 +222,14 @@ handle_request(void *cls, struct MHD_Connection *connection,
 	struct brubeck_server *brubeck = cls;
 
 	if (!strcmp(method, "GET")) {
-		if (!strcmp(url, "/ping")) {
-			char *jsonr;
-			json_t *pong = json_pack("{s:s, s:i, s:s}",
-				"version", "brubeck " GIT_SHA,
-				"pid", (int)getpid(),
-				"status", "OK");
-
-			jsonr = json_dumps(pong, JSON_PRESERVE_ORDER);
-			response = MHD_create_response_from_data(strlen(jsonr), jsonr, 1, 0);
-			json_decref(pong);
-		}
+		if (!strcmp(url, "/_ping") || !strcmp(url, "/ping"))
+			response = send_ping(brubeck);
 
 		else if (!strcmp(url, "/stats"))
 			response = send_stats(brubeck);
+
+		else if (!strcmp(url, "/flow_stats"))
+			response = flow_stats(brubeck);
 
 		else if (starts_with(url, "/metric/"))
 			response = send_metric(brubeck, url);
